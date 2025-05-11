@@ -1,5 +1,5 @@
-;; Word Wizards Smart Contract - Stage 2 (Enhanced Features)
-;; This contract manages a word puzzle game with difficulty levels and scoring
+;; Word Wizards Smart Contract
+;; This contract manages a word puzzle game with daily challenges and leaderboards
 
 ;; Error codes
 (define-constant ERR-UNAUTHORIZED (err u100))
@@ -11,6 +11,10 @@
 (define-constant ERR-INVALID-SOLUTION (err u106))
 (define-constant ERR-NOT-ACTIVE (err u107))
 (define-constant ERR-INVALID-PLAYER (err u108))
+(define-constant ERR-INSUFFICIENT-BALANCE (err u109))
+(define-constant ERR-PRIZE-CLAIMED (err u110))
+(define-constant ERR-NOT-WINNER (err u111))
+(define-constant ERR-NOT-AVAILABLE (err u112))
 (define-constant ERR-SYSTEM-PAUSED (err u113))
 
 ;; Puzzle difficulty levels
@@ -26,6 +30,8 @@
     hint: (string-ascii 100),
     difficulty: uint,
     creator: principal,
+    entry-fee: uint,
+    prize-pool: uint,
     solved-count: uint,
     active: bool
   }
@@ -54,10 +60,16 @@
   }
 )
 
+(define-map prize-claims
+  { day-id: uint, player: principal }
+  { claimed: bool, amount: uint }
+)
+
 ;; Variables
 (define-data-var day-counter uint u0)
 (define-data-var game-admin principal tx-sender)
 (define-data-var paused bool false)
+(define-data-var platform-fee-percent uint u10) ;; 10% platform fee
 
 ;; Access control
 (define-private (is-admin)
@@ -86,7 +98,7 @@
 )
 
 ;; Create a new daily puzzle
-(define-public (create-puzzle (word (string-ascii 20)) (hint (string-ascii 100)) (difficulty uint))
+(define-public (create-puzzle (word (string-ascii 20)) (hint (string-ascii 100)) (difficulty uint) (entry-fee uint))
   (let (
     (day-id (+ (var-get day-counter) u1))
   )
@@ -103,6 +115,8 @@
         hint: hint,
         difficulty: difficulty,
         creator: tx-sender,
+        entry-fee: entry-fee,
+        prize-pool: u0,
         solved-count: u0,
         active: true
       }
@@ -124,6 +138,23 @@
     (asserts! (is-active) ERR-SYSTEM-PAUSED)
     (asserts! (get active puzzle) ERR-CHALLENGE-EXPIRED)
     (asserts! (is-none (map-get? player-solutions { day-id: day-id, player: tx-sender })) ERR-ALREADY-SUBMITTED)
+    
+    ;; Handle entry fee if required
+    (if (> (get entry-fee puzzle) u0)
+      (begin
+        ;; Transfer fee to contract - requires STX
+        (unwrap! (stx-transfer? (get entry-fee puzzle) tx-sender (as-contract tx-sender)) ERR-INSUFFICIENT-BALANCE)
+        
+        ;; Update prize pool
+        (map-set daily-puzzles
+          { day-id: day-id }
+          (merge puzzle {
+            prize-pool: (+ (get prize-pool puzzle) (get entry-fee puzzle))
+          })
+        )
+      )
+      true
+    )
     
     ;; Check if solution is correct
     (let (
@@ -217,6 +248,65 @@
   ;; In a real implementation, this would query a sorted list of scores
   ;; This is a placeholder
   (some u500)
+)
+
+;; Get winning player for a puzzle (simplified)
+(define-read-only (get-winning-player (day-id uint))
+  ;; This is simplified. In a real contract, you'd need to track the winning player
+  (some 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9)
+)
+
+;; Calculate prize for a player
+(define-read-only (calculate-prize (day-id uint) (player principal))
+  (let (
+    (puzzle (unwrap! (map-get? daily-puzzles { day-id: day-id }) ERR-PUZZLE-NOT-FOUND))
+    (player-solution (unwrap! (map-get? player-solutions { day-id: day-id, player: player }) ERR-SOLUTION-NOT-FOUND))
+    (prize-pool (get prize-pool puzzle))
+  )
+    (asserts! (not (get active puzzle)) ERR-NOT-AVAILABLE)
+    (asserts! (get correct player-solution) ERR-NOT-WINNER)
+    
+    ;; Prize distribution logic - simplified for clarity
+    ;; In reality, would use a more complex distribution based on rank
+    (let (
+      (platform-fee (/ (* prize-pool (var-get platform-fee-percent)) u100))
+      (distributable-pool (- prize-pool platform-fee))
+      (winner (unwrap! (get-winning-player day-id) ERR-NOT-WINNER))
+    )
+      (if (is-eq player winner)
+        ;; Winner gets 50% of pool
+        (ok (/ distributable-pool u2))
+        ;; Other correct answers split the remaining 50%
+        (ok (/ (/ distributable-pool u2) (get solved-count puzzle)))
+      )
+    )
+  )
+)
+
+;; Claim prize
+(define-public (claim-prize (day-id uint))
+  (let (
+    (puzzle (unwrap! (map-get? daily-puzzles { day-id: day-id }) ERR-PUZZLE-NOT-FOUND))
+    (player-solution (unwrap! (map-get? player-solutions { day-id: day-id, player: tx-sender }) ERR-SOLUTION-NOT-FOUND))
+    (prize-claim (default-to { claimed: false, amount: u0 } (map-get? prize-claims { day-id: day-id, player: tx-sender })))
+    (prize-amount (unwrap! (calculate-prize day-id tx-sender) ERR-NOT-WINNER))
+  )
+    (asserts! (is-active) ERR-SYSTEM-PAUSED)
+    (asserts! (not (get active puzzle)) ERR-NOT-AVAILABLE)
+    (asserts! (not (get claimed prize-claim)) ERR-PRIZE-CLAIMED)
+    (asserts! (> prize-amount u0) ERR-NOT-WINNER)
+    
+    ;; Mark prize as claimed
+    (map-set prize-claims
+      { day-id: day-id, player: tx-sender }
+      { claimed: true, amount: prize-amount }
+    )
+    
+    ;; Transfer prize to player
+    (unwrap! (as-contract (stx-transfer? prize-amount (as-contract tx-sender) tx-sender)) ERR-INSUFFICIENT-BALANCE)
+    
+    (ok prize-amount)
+  )
 )
 
 ;; Get player stats
